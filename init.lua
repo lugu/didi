@@ -7,8 +7,7 @@ minetest.register_node("didi:crystal", {
 	tiles = {
 		"crystal_block.png",
 	},
-        is_ground_content = true,
-        groups = {cracky = 1},
+        groups = {cracky=3, stone=1},
         -- Use the drop property to drop something a specific item.
         -- drop = "didi:crystal_fragments"
         on_construct = function (pos, node)
@@ -45,21 +44,21 @@ minetest.register_node("didi:crystal", {
                 minetest.add_item(pos, "mcl_core:dirt ")
             end
         end,
-        on_rightclick = function(pos, node, clicker, itemstack, pointed_thing)
-            if clicker:is_player() then
-                print("crystal on_rightclick")
-            end
-        end,
+})
+minetest.register_node("didi:selector", {
+	description = "Le selecteur de coffres du tresor d'Orion",
+        drawtype = "glasslike",
+	tiles = {
+		"selector.png",
+	},
+        groups = {cracky=3, stone=1},
 })
 minetest.register_node("didi:cannon", {
 	description = "Le cannon d'Yvain",
         drawtype = "mesh",
         mesh = "cannon.glb",
-        -- collisionbox = {-0.5, -0.5, -0.5, 0.5, 0.5, 0.5},
-        -- visual_scale = 1,
-        -- paramtype2 = "facedir",
 	tiles = {
-		"cannon_block_2.png",
+		"cannon_block_3.png",
 	},
         is_ground_content = true,
         groups = {cracky = 1},
