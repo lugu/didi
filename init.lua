@@ -16,11 +16,10 @@ core.register_node("didi:crystal", {
 		meta:set_int("random_number", math.random(0, 9))
 		print("crystal on_construct" .. meta:get_int("random_number"))
 	end,
-	on_destruct = function(pos, node)
+	on_dig = function(pos, node, digger)
 		-- get the random number from the meta data of the node
 		local meta = core.get_meta(pos)
 		local random_number = meta:get_int("random_number")
-		print("crystal on_destruct" .. random_number)
 		-- drop a specific item based on the random number
 		if random_number == 0 then
 			core.add_item(pos, "mobs_mc:diamond_horse_armor")
@@ -43,6 +42,8 @@ core.register_node("didi:crystal", {
 		elseif random_number == 9 then
 			core.add_item(pos, "mcl_core:dirt")
 		end
+		-- apply dig effect (put item in inventory, remove node)
+		return core.node_dig(pos, node, digger)
 	end,
 })
 
