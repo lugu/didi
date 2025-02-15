@@ -1,13 +1,68 @@
 print("Welcome to didi - from the mod")
+
 -- Documentation: https://api.luanti.org/mods/
 -- Book: https://rubenwardy.com/core_modding_book/en/
+-- Course: https://www.codecademy.com/courses/learn-lua/lessons/introduction-to-lua/exercises/review
+
+-- TODO: make a chest
+-- local chestusage = "To access its inventory, rightclick it. When broken, the items will drop out."
+--
+-- require(core.get_modpath("mcl_chests"))
+--
+-- mcl_chests.register_chest("didi:foam_chest", {
+-- 	desc = "Chest",
+-- 	longdesc = "Chests are containers which provide 27 inventory slots. Chests can be turned into large chests with "
+-- 		.. "double the capacity by placing two chests next to each other.",
+-- 	usagehelp = chestusage,
+-- 	tt_help = "27 inventory slots\nCan be combined to a large chest",
+-- 	tiles = {
+-- 		small = mcl_chests.tiles.chest_normal_small,
+-- 		double = mcl_chests.tiles.chest_normal_double,
+-- 		inv = {
+-- 			"foam_block.png",
+-- 			"foam_block.png",
+-- 			"foam_block.png",
+-- 			"foam_block.png",
+-- 			"foam_block.png",
+-- 			"foam_block.png",
+-- 		},
+-- 	},
+-- 	groups = {
+-- 		handy = 1,
+-- 		axey = 1,
+-- 		material_wood = 1,
+-- 		flammable = -1,
+-- 	},
+-- 	sounds = { mcl_sounds.node_sound_wood_defaults() },
+-- 	hardness = 2.5,
+-- 	hidden = false,
+-- })
+
+-- Dragon head
+core.register_craftitem("didi:dragon_head", {
+	description = "Dragon Head from Orion",
+	inventory_image = "dragon_item.png",
+	visual = "mesh",
+	mesh = "dragon_head.glb",
+	textures = {
+		"dragon_white.png",
+		"dragon_black.png",
+	},
+})
+
+local function get_chest_formspec(pos)
+	local spos = pos.x .. "," .. pos.y .. "," .. pos.z
+	local formspec = "size[8,9]" .. "list[context;main;0,0;8,4;]" .. "list[current_player;main;0,5;8,4;]"
+	return formspec
+end
 
 core.register_node("didi:crystal", {
 	description = "Le crystal d'Orion",
+	paramtype2 = "facedir",
 	tiles = {
 		"crystal_block.png",
 	},
-	groups = { cracky = 3, stone = 1 },
+	groups = { dig_immediate = 2, choppy = 3 },
 	-- Use the drop property to drop something a specific item.
 	-- drop = "didi:crystal_fragments"
 	on_construct = function(pos, node)
@@ -16,34 +71,16 @@ core.register_node("didi:crystal", {
 		meta:set_int("random_number", math.random(0, 9))
 		print("crystal on_construct" .. meta:get_int("random_number"))
 	end,
-	on_dig = function(pos, node, digger)
-		-- get the random number from the meta data of the node
+	on_rightclick = function(pos, node, clicker)
 		local meta = core.get_meta(pos)
 		local random_number = meta:get_int("random_number")
-		-- drop a specific item based on the random number
-		if random_number == 0 then
-			core.add_item(pos, "mobs_mc:diamond_horse_armor")
-		elseif random_number == 1 then
-			core.add_item(pos, "mcl_tools:pick_diamond")
-		elseif random_number == 2 then
-			core.add_item(pos, "mcl_core:apple_gold_enchanted")
-		elseif random_number == 3 then
-			core.add_item(pos, "mcl_mobitems:nautilus_shell")
-		elseif random_number == 4 then
-			core.add_item(pos, "mcl_raw_ores:raw_iron_block")
-		elseif random_number == 5 then
-			core.add_item(pos, "mcl_tools:pick_netherite")
-		elseif random_number == 6 then
-			core.add_item(pos, "mcl_mobs:nametag")
-		elseif random_number == 7 then
-			core.add_item(pos, "mcl_nether:netherite_ingot")
-		elseif random_number == 8 then
-			core.add_item(pos, "mcl_mobitems:nautilus_shell")
-		elseif random_number == 9 then
-			core.add_item(pos, "mcl_core:dirt")
-		end
-		-- apply dig effect (put item in inventory, remove node)
-		return core.node_dig(pos, node, digger)
+		local player_name = clicker:get_player_name()
+		-- if random_number ~= 8 then
+		-- 	core.chat_send_player(player_name, core.colorize("#ff0000", "Wrong crystal!"))
+		-- 	core.log("action", player_name .. " tried to access the wrong chest")
+		-- 	return
+		-- end
+		core.show_formspec(player_name, "didi:crystal", get_chest_formspec(pos))
 	end,
 })
 
@@ -105,8 +142,8 @@ core.register_node("didi:cannon", {
 		print("cannon on_rightclick")
 		-- decide which direction to shoot
 		local meta = core.get_meta(pos)
-		x = meta:get_int("bullet_direction_x")
-		z = meta:get_int("bullet_direction_z")
+		local x = meta:get_int("bullet_direction_x")
+		local z = meta:get_int("bullet_direction_z")
 		local bullet_direction = vector.new(x, 0, z)
 
 		-- cannon change direction each times it shoots.
