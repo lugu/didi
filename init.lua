@@ -1,4 +1,12 @@
-print("Welcome to didi - from the mod")
+print("    *              *         ")
+print("    *    *         *    *    ")
+print("    *              *         ")
+print("*** *   **     *** *   **    ")
+print("   **    *    *   **    *    ")
+print("    *    *    *    *    *    ")
+print("    *    *    *    *    *    ")
+print("   **    *    *   **    *    ")
+print("*** *  *****   *** *  *****  ")
 
 -- Documentation: https://api.luanti.org/mods/
 -- Book: https://rubenwardy.com/core_modding_book/en/
@@ -174,7 +182,7 @@ local Bullet = {
 		spritediv = { x = 1, y = 1 },
 		initial_sprite_basepos = { x = 0, y = 0 },
 	},
-	_velocity = 2, -- speed of the bullet
+	_velocity = 8, -- speed of the bullet
 	_max_distance = 100, -- how far the bullet goes
 }
 
