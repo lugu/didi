@@ -184,12 +184,32 @@ local Bullet = {
 	},
 	_velocity = 8, -- speed of the bullet
 	_max_distance = 100, -- how far the bullet goes
+	_damage = 4, -- damage points the bullet inflicts
 }
 
-function Bullet:on_step(dtime)
+function Bullet:on_step(dtime, moveresult)
 	-- make the bullet disapear once it has hit an obstacle
 	if self.object:get_velocity() == vector.zero() then
 		self.object:set_hp(0)
+	end
+
+	-- Check for collisions with other objects.
+	if moveresult and moveresult.collisions then
+		for _, collision in ipairs(moveresult.collisions) do
+			if collision.type == "object" and collision.object then
+				local collided_object = collision.object
+				local collided_entity = collided_object:get_luaentity()
+
+				-- Check if the collided object is a player or an NPC.
+				if collided_object:is_player() or (collided_entity and collided_entity.name ~= "__builtin:item") then
+					-- Deal damage to the collided object.
+					collided_object:set_hp(collided_object:get_hp() - self._damage)
+					-- Remove the bullet after hitting a target.
+					self.object:set_hp(0)
+					return -- Exit the function to prevent multiple hits from one bullet.
+				end
+			end
+		end
 	end
 end
 
