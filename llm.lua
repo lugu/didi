@@ -166,7 +166,7 @@ return function(http)
 	end
 
 	-- Magical explosion helper
-	local function trigger_magic_explosion(world_pos, radius)
+	local function trigger_magic_explosion(world_pos, radius, record_node_fn)
 		radius = math.min(math.max(tonumber(radius) or 3, 1), 8)
 		core.add_particlespawner({
 			amount = 80,
@@ -191,6 +191,9 @@ return function(http)
 						local p = vector.offset(world_pos, dx, dy, dz)
 						local n = core.get_node(p).name
 						if n ~= "air" and n ~= "ignore" then
+							if record_node_fn then
+								record_node_fn(p)
+							end
 							table.insert(to_clear, p)
 						end
 					end
@@ -270,17 +273,22 @@ return function(http)
 
 	core.register_entity("didi:fireball", Fireball)
 
-	-- Build the sandboxed environment with medieval & magic helpers for a given player
-	local create_llm_env
-	local execute_llm_code
+	-- Per-player undo stacks and multi-turn conversation histories
+	local MAX_UNDO_HISTORY = 20
+	local MAX_HISTORY_TURNS = 5
+	local undo_history = {}
+	local conversation_history = {}
+	local next_turn_id = 0
 
-	create_llm_env = function(player_name)
+	-- Capture a snapshot of the player's position and orientation at command invocation time
+	local function capture_origin(player_name)
 		local player = core.get_player_by_name(player_name)
 		if not player then
 			return nil
 		end
 
-		local player_pos = vector.round(player:get_pos())
+		local exact_pos = player:get_pos()
+		local player_pos = vector.round(exact_pos)
 		local look = player:get_look_dir()
 
 		local forward
@@ -299,9 +307,254 @@ return function(http)
 			)
 		end
 
+		local function to_local(wpos)
+			local dx = wpos.x - player_pos.x
+			local dy = wpos.y - player_pos.y
+			local dz = wpos.z - player_pos.z
+			local f = dx * forward.x + dz * forward.z
+			local r = dx * right.x + dz * right.z
+			return math.floor(f + 0.5), math.floor(dy + 0.5), math.floor(r + 0.5)
+		end
+
+		return {
+			player_name = player_name,
+			pos = player_pos,
+			exact_pos = exact_pos,
+			look_dir = look,
+			forward = forward,
+			right = right,
+			to_world = to_world,
+			to_local = to_local,
+		}
+	end
+
+	-- Inspect terrain and environment in front of the captured origin to give context to the LLM
+	local function get_world_context(origin, prev_origin)
+		if not origin then
+			return ""
+		end
+
+		local lines = {}
+		local dir_label
+		if origin.forward.x == 1 then
+			dir_label = "+X (Est)"
+		elseif origin.forward.x == -1 then
+			dir_label = "-X (Ouest)"
+		elseif origin.forward.z == 1 then
+			dir_label = "+Z (Nord)"
+		else
+			dir_label = "-Z (Sud)"
+		end
+
+		table.insert(
+			lines,
+			string.format(
+				"- Position d'origine du joueur (f=0, u=0, r=0) : monde (%d, %d, %d), direction regardée : %s",
+				origin.pos.x,
+				origin.pos.y,
+				origin.pos.z,
+				dir_label
+			)
+		)
+
+		if prev_origin then
+			local pf, pu, pr = origin.to_local(prev_origin.pos)
+			table.insert(
+				lines,
+				string.format(
+					"- Origine de la commande précédente dans le repère actuel : (f=%d, u=%d, r=%d)",
+					pf,
+					pu,
+					pr
+				)
+			)
+		end
+
+		-- Raycast along the player's look direction up to 20 blocks
+		local eye_pos = vector.offset(origin.exact_pos or origin.pos, 0, 1, 0)
+		local target_info = nil
+		for dist = 1, 20 do
+			local check_pos = vector.round(vector.add(eye_pos, vector.multiply(origin.look_dir, dist)))
+			local node = core.get_node(check_pos)
+			if node and node.name ~= "air" and node.name ~= "ignore" then
+				local tf, tu, tr = origin.to_local(check_pos)
+				target_info = string.format("%s en (f=%d, u=%d, r=%d)", node.name, tf, tu, tr)
+				break
+			end
+		end
+		if target_info then
+			table.insert(lines, "- Bloc visé par le regard : " .. target_info)
+		end
+
+		-- Sample terrain elevation and surface blocks in the build area in front of the origin
+		local sample_f = { 6, 12, 18, 24 }
+		local sample_r = { -6, 0, 6 }
+		local min_u, max_u, sum_u, count_u = nil, nil, 0, 0
+		local surface_counts = {}
+		local center_profile = {}
+
+		for _, f in ipairs(sample_f) do
+			for _, r in ipairs(sample_r) do
+				local ground_u = nil
+				local ground_name = nil
+				for u = 10, -6, -1 do
+					local n = core.get_node(origin.to_world(f, u, r)).name
+					if n ~= "air" and n ~= "ignore" then
+						ground_u = u
+						ground_name = n
+						break
+					end
+				end
+				if ground_u then
+					if not min_u or ground_u < min_u then
+						min_u = ground_u
+					end
+					if not max_u or ground_u > max_u then
+						max_u = ground_u
+					end
+					sum_u = sum_u + ground_u
+					count_u = count_u + 1
+					surface_counts[ground_name] = (surface_counts[ground_name] or 0) + 1
+					if r == 0 then
+						table.insert(center_profile, string.format("f=%d -> u=%d (%s)", f, ground_u, ground_name))
+					end
+				end
+			end
+		end
+
+		if count_u > 0 then
+			local avg_u = math.floor((sum_u / count_u) + 0.5)
+			table.insert(
+				lines,
+				string.format(
+					"- Hauteur du sol devant le joueur (zone f=6..24, r=-6..6) : min u=%d, max u=%d, moyenne u=%d",
+					min_u,
+					max_u,
+					avg_u
+				)
+			)
+		end
+
+		if #center_profile > 0 then
+			table.insert(lines, "- Profil du sol au centre (r=0) : " .. table.concat(center_profile, ", "))
+		end
+
+		local top_blocks = {}
+		for name, cnt in pairs(surface_counts) do
+			table.insert(top_blocks, { name = name, count = cnt })
+		end
+		table.sort(top_blocks, function(a, b)
+			if a.count == b.count then
+				return a.name < b.name
+			end
+			return a.count > b.count
+		end)
+		if #top_blocks > 0 then
+			local names = {}
+			for i = 1, math.min(4, #top_blocks) do
+				table.insert(names, top_blocks[i].name)
+			end
+			table.insert(lines, "- Blocs de surface dominants : " .. table.concat(names, ", "))
+		end
+
+		return table.concat(lines, "\n")
+	end
+
+	-- Undo the last LLM action for a player
+	local function undo_last(player_name)
+		local stack = undo_history[player_name]
+		if not stack or #stack == 0 then
+			return false, core.colorize("#ffaa00", "[GOD] Aucune action à annuler.")
+		end
+
+		local entry = table.remove(stack)
+
+		local restored_nodes = 0
+		for i = #entry.node_list, 1, -1 do
+			local item = entry.node_list[i]
+			core.set_node(item.pos, item.node)
+			restored_nodes = restored_nodes + 1
+		end
+
+		local removed_entities = 0
+		for _, obj in ipairs(entry.entities) do
+			if obj and obj.remove then
+				local ok = pcall(function()
+					obj:remove()
+				end)
+				if ok then
+					removed_entities = removed_entities + 1
+				end
+			end
+		end
+
+		-- Keep multi-turn conversation history in sync if the undone action was the latest turn
+		local conv = conversation_history[player_name]
+		if conv and #conv > 0 and entry.turn_id and conv[#conv].id == entry.turn_id then
+			table.remove(conv)
+		end
+
+		return true,
+			core.colorize(
+				"#55ff55",
+				string.format(
+					"[GOD] Annulation effectuée (%d blocs restaurés, %d entités supprimées).",
+					restored_nodes,
+					removed_entities
+				)
+			)
+	end
+
+	-- Build the sandboxed environment with medieval & magic helpers for a given player and origin
+	local create_llm_env
+	local execute_llm_code
+
+	create_llm_env = function(player_name, origin, undo_entry)
+		origin = origin or capture_origin(player_name)
+		if not origin then
+			return nil
+		end
+
+		local player = core.get_player_by_name(player_name)
+		local player_pos = origin.pos
+		local forward = origin.forward
+		local right = origin.right
+		local to_world = origin.to_world
+
+		local function record_node(wpos)
+			if not undo_entry then
+				return
+			end
+			local x = math.floor(wpos.x + 0.5)
+			local y = math.floor(wpos.y + 0.5)
+			local z = math.floor(wpos.z + 0.5)
+			local key = x .. "," .. y .. "," .. z
+			if not undo_entry.nodes[key] then
+				local cur = core.get_node({ x = x, y = y, z = z }) or { name = "air" }
+				local record = {
+					pos = { x = x, y = y, z = z },
+					node = {
+						name = cur.name or "air",
+						param1 = cur.param1 or 0,
+						param2 = cur.param2 or 0,
+					},
+				}
+				undo_entry.nodes[key] = record
+				table.insert(undo_entry.node_list, record)
+			end
+		end
+
+		local function record_entity(obj)
+			if undo_entry and obj then
+				table.insert(undo_entry.entities, obj)
+			end
+		end
+
 		local function place(f, u, r, block)
 			local node_name = resolve_node(block)
-			core.set_node(to_world(f, u, r), { name = node_name })
+			local wpos = to_world(f, u, r)
+			record_node(wpos)
+			core.set_node(wpos, { name = node_name })
 		end
 
 		local function get_block(f, u, r)
@@ -321,7 +574,9 @@ return function(http)
 			for f = min_f, max_f do
 				for u = min_u, max_u do
 					for r = min_r, max_r do
-						table.insert(positions, to_world(f, u, r))
+						local wpos = to_world(f, u, r)
+						record_node(wpos)
+						table.insert(positions, wpos)
 					end
 				end
 			end
@@ -375,10 +630,12 @@ return function(http)
 					for dr = -r_int, r_int do
 						local dist = math.sqrt(df * df + dr * dr)
 						if dist <= radius + 0.35 then
+							local wpos = to_world(f_center + df, u, r_center + dr)
+							record_node(wpos)
 							if hollow and dist < radius - 0.75 then
-								table.insert(air_positions, to_world(f_center + df, u, r_center + dr))
+								table.insert(air_positions, wpos)
 							else
-								table.insert(wall_positions, to_world(f_center + df, u, r_center + dr))
+								table.insert(wall_positions, wpos)
 							end
 						end
 					end
@@ -403,7 +660,9 @@ return function(http)
 				for df = -r_int, r_int do
 					for dr = -r_int, r_int do
 						if math.sqrt(df * df + dr * dr) <= cur_r + 0.35 then
-							table.insert(positions, to_world(f_center + df, u_base + dy, r_center + dr))
+							local wpos = to_world(f_center + df, u_base + dy, r_center + dr)
+							record_node(wpos)
+							table.insert(positions, wpos)
 						end
 					end
 				end
@@ -416,21 +675,25 @@ return function(http)
 		local function spawn(f, u, r, entity_name)
 			local ent = resolve_entity(entity_name)
 			if ent then
-				return core.add_entity(to_world(f, u, r), ent)
+				local obj = core.add_entity(to_world(f, u, r), ent)
+				record_entity(obj)
+				return obj
 			end
 			return nil
 		end
 
 		local function shoot_fireball(speed)
 			local p = core.get_player_by_name(player_name)
-			if not p then
+			local shoot_dir = (p and p:get_look_dir()) or origin.look_dir
+			local base_pos = (p and p:get_pos()) or origin.exact_pos or origin.pos
+			if not shoot_dir or not base_pos then
 				return
 			end
-			local shoot_dir = p:get_look_dir()
-			local start_pos = vector.offset(p:get_pos(), 0, 1.5, 0)
+			local start_pos = vector.offset(base_pos, 0, 1.5, 0)
 			start_pos = vector.add(start_pos, vector.multiply(shoot_dir, 1.2))
 			local obj = core.add_entity(start_pos, "didi:fireball")
 			if obj then
+				record_entity(obj)
 				local luaent = obj:get_luaentity()
 				if luaent then
 					luaent._shooter = player_name
@@ -457,6 +720,7 @@ return function(http)
 			})
 			local fire_node = resolve_node("fire")
 			if core.get_node(wpos).name == "air" then
+				record_node(wpos)
 				core.set_node(wpos, { name = fire_node })
 			end
 			for _, obj in ipairs(core.get_objects_inside_radius(wpos, 4)) do
@@ -467,7 +731,7 @@ return function(http)
 		end
 
 		local function explosion(f, u, r, radius)
-			trigger_magic_explosion(to_world(f, u, r), radius)
+			trigger_magic_explosion(to_world(f, u, r), radius, record_node)
 		end
 
 		local function heal(amount)
@@ -544,12 +808,19 @@ return function(http)
 		return env
 	end
 
-	execute_llm_code = function(player_name, code)
+	execute_llm_code = function(player_name, code, origin, turn_id)
 		-- Strip markdown code blocks if present
 		code = code:gsub("^%s*```[%w_]*%s*\n", ""):gsub("\n%s*```%s*$", "")
 		code = code:gsub("^%s*```%s*", ""):gsub("%s*```%s*$", "")
 
-		local env = create_llm_env(player_name)
+		local undo_entry = {
+			nodes = {},
+			node_list = {},
+			entities = {},
+			turn_id = turn_id,
+		}
+
+		local env = create_llm_env(player_name, origin, undo_entry)
 		if not env then
 			return false
 		end
@@ -573,6 +844,14 @@ return function(http)
 		end
 
 		local ok, run_err = pcall(fn)
+		if #undo_entry.node_list > 0 or #undo_entry.entities > 0 or turn_id then
+			undo_history[player_name] = undo_history[player_name] or {}
+			table.insert(undo_history[player_name], undo_entry)
+			while #undo_history[player_name] > MAX_UNDO_HISTORY do
+				table.remove(undo_history[player_name], 1)
+			end
+		end
+
 		if not ok then
 			core.chat_send_player(
 				player_name,
@@ -608,16 +887,17 @@ return function(http)
 
 	local SYSTEM_PROMPT = [[
 Tu es un architecte et mage expert dans Luanti (Minetest / VoxeLibre) spécialisé dans le Moyen-Âge (châteaux, tours, donjons, pont-levis, villages médiévaux) et la magie.
-L'utilisateur t'envoie une demande via la commande `/god`.
+L'utilisateur t'envoie une demande via la commande `/god`, accompagnée du contexte du terrain local et de l'historique éventuel des commandes précédentes.
 Tu dois répondre UNIQUEMENT avec du code Lua exécutable (sans texte avant ni après, sans balises markdown ```lua).
 
-Système de coordonnées locales relatif au joueur `(f, u, r)` :
-- `f` (forward) : distance DEVANT le joueur. `f = 6` est à 6 blocs devant lui. Construis toujours les structures devant le joueur (par exemple entre `f = 6` et `f = 30`).
-- `u` (up) : hauteur par rapport aux pieds du joueur (`u = 0` est le niveau du sol, `u = -1` est les fondations).
+Système de coordonnées locales relatif à la position d'invocation du joueur `(f, u, r)` :
+- `f` (forward) : distance DEVANT le joueur. `f = 6` est à 6 blocs devant lui. Construis toujours les structures devant le joueur (par exemple entre `f = 6` et `f = 30`), sauf si l'utilisateur demande de modifier une construction précédente.
+- `u` (up) : hauteur par rapport aux pieds du joueur (`u = 0` est le niveau des pieds du joueur, adapte la base de tes constructions à la hauteur du sol indiquée dans le contexte terrain).
 - `r` (right) : décalage gauche/droite (`r = 0` est centré face au joueur, `r < 0` est à gauche, `r > 0` est à droite).
 
 Fonctions disponibles directement dans ton code Lua :
 - `place(f, u, r, block)` : place un bloc en `(f, u, r)`.
+- `get_block(f, u, r)` : retourne le nom du bloc présent en `(f, u, r)`.
 - `box(f1, u1, r1, f2, u2, r2, block)` : remplit un pavé plein de `(f1, u1, r1)` à `(f2, u2, r2)`.
 - `clear(f1, u1, r1, f2, u2, r2)` : vide la zone avec `"air"`.
 - `hollow_box(f1, u1, r1, f2, u2, r2, block, has_roof, has_floor)` : construit des murs creux (idéal pour remparts, salles, donjons).
@@ -635,15 +915,25 @@ Fonctions disponibles directement dans ton code Lua :
 Noms de blocs recommandés :
 `"stonebrick"`, `"mossy_stonebrick"`, `"cracked_stonebrick"`, `"chiseled_stonebrick"`, `"cobble"`, `"stone"`, `"oak_planks"`, `"spruce_planks"`, `"dark_oak_planks"`, `"oak_log"`, `"spruce_log"`, `"fence"`, `"iron_bars"`, `"glass"`, `"torch"`, `"lantern"`, `"glowstone"`, `"water"`, `"lava"`, `"fire"`, `"gold"`, `"iron"`, `"obsidian"`, `"red_wool"`, `"blue_wool"`, `"white_wool"`, `"bookshelf"`, `"cannon"`, `"crystal"`, `"air"`.
 
-Conseils pour les châteaux et constructions médiévales :
+Conseils pour les châteaux, le terrain et la mémoire multi-tours :
+- Utilise le contexte du terrain fourni pour aligner les fondations avec le sol réel et tenir compte des obstacles ou du bloc visé.
+- Si l'utilisateur fait référence à une construction précédente (ex: "ajoute un pont-levis", "agrandis la tour"), utilise l'historique de conversation et le décalage d'origine indiqué pour modifier uniquement la partie demandée sans tout reconstruire.
 - Fais des constructions détaillées et impressionnantes : douves d'eau (`"water"`), pont en bois (`"spruce_planks"`), 4 tours d'angle rondes (`cylinder(..., true)`) coiffées de toits pointus (`cone(...)`), remparts en `"stonebrick"` avec créneaux (`battlements(...)`), une grande porte avec herse en `"iron_bars"`, un donjon central (`hollow_box(...)`), des drapeaux en `"red_wool"` et de l'éclairage (`"lantern"` ou `"torch"`).
 - Termine toujours ton script par un appel à `say("...")` expliquant brièvement ce que tu as créé.
 ]]
+
+	-- Privilege required to invoke /god commands (not granted by default)
+	core.register_privilege("god", {
+		description = "Permet d'utiliser les commandes /god, /god_key, /god_undo et /god_reset",
+		give_to_singleplayer = false,
+		give_to_admin = false,
+	})
 
 	-- Command to set Gemini API key in-game
 	core.register_chatcommand("god_key", {
 		params = "<cle_api_gemini>",
 		description = "Configure la clé API Google Gemini pour la commande /god",
+		privs = { god = true },
 		func = function(_, param)
 			local key = (param or ""):match("^%s*(.-)%s*$")
 			if key == "" then
@@ -654,7 +944,28 @@ Conseils pour les châteaux et constructions médiévales :
 		end,
 	})
 
-	local function call_gemini(name, body, api_key, model, is_retry)
+	-- Command to undo the last /god build or effect
+	core.register_chatcommand("god_undo", {
+		params = "",
+		description = "Annule la dernière construction ou action effectuée par /god",
+		privs = { god = true },
+		func = function(name)
+			return undo_last(name)
+		end,
+	})
+
+	-- Command to clear the player's multi-turn conversation memory
+	core.register_chatcommand("god_reset", {
+		params = "",
+		description = "Réinitialise la mémoire de conversation multi-tours de /god",
+		privs = { god = true },
+		func = function(name)
+			conversation_history[name] = {}
+			return true, core.colorize("#55ff55", "[GOD] Mémoire de conversation réinitialisée.")
+		end,
+	})
+
+	local function call_gemini(name, body, api_key, model, is_retry, origin, user_message, raw_prompt)
 		local url = "https://generativelanguage.googleapis.com/v1beta/models/"
 			.. model
 			.. ":generateContent?key="
@@ -677,7 +988,7 @@ Conseils pour les châteaux et constructions médiévales :
 				local suggested_model = not is_retry and tostring(err_msg):match("use models/([%w%-%._]+)")
 				if suggested_model and suggested_model ~= model then
 					mod_storage:set_string("gemini_model", suggested_model)
-					call_gemini(name, body, api_key, suggested_model, true)
+					call_gemini(name, body, api_key, suggested_model, true, origin, user_message, raw_prompt)
 					return
 				end
 
@@ -704,7 +1015,23 @@ Conseils pour les châteaux et constructions médiévales :
 			end
 
 			local lua_code = parsed.candidates[1].content.parts[1].text or ""
-			execute_llm_code(name, lua_code)
+			next_turn_id = next_turn_id + 1
+			local turn_id = next_turn_id
+
+			local ok = execute_llm_code(name, lua_code, origin, turn_id)
+			if ok and user_message then
+				conversation_history[name] = conversation_history[name] or {}
+				table.insert(conversation_history[name], {
+					id = turn_id,
+					user_text = user_message,
+					raw_prompt = raw_prompt,
+					model_code = lua_code,
+					origin = origin,
+				})
+				while #conversation_history[name] > MAX_HISTORY_TURNS do
+					table.remove(conversation_history[name], 1)
+				end
+			end
 		end)
 	end
 
@@ -712,6 +1039,7 @@ Conseils pour les châteaux et constructions médiévales :
 	core.register_chatcommand("god", {
 		params = "<demande>",
 		description = "Demande au LLM de créer quelque chose (ex: /god fais un chateau devant moi)",
+		privs = { god = true },
 		func = function(name, param)
 			local prompt = (param or ""):match("^%s*(.-)%s*$")
 			if prompt == "" then
@@ -735,6 +1063,37 @@ Conseils pour les châteaux et constructions médiévales :
 					)
 			end
 
+			-- Snapshot the player's position and orientation right at invocation time
+			local origin = capture_origin(name)
+			if not origin then
+				return false, core.colorize("#ff5555", "[GOD] Joueur introuvable.")
+			end
+
+			local history = conversation_history[name] or {}
+			local prev_origin = (#history > 0) and history[#history].origin or nil
+			local world_ctx = get_world_context(origin, prev_origin)
+
+			local user_message = "Contexte du monde (au moment de l'invocation) :\n"
+				.. world_ctx
+				.. "\n\nDemande du joueur : "
+				.. prompt
+
+			local contents = {}
+			for _, turn in ipairs(history) do
+				table.insert(contents, {
+					role = "user",
+					parts = { { text = turn.user_text } },
+				})
+				table.insert(contents, {
+					role = "model",
+					parts = { { text = turn.model_code } },
+				})
+			end
+			table.insert(contents, {
+				role = "user",
+				parts = { { text = user_message } },
+			})
+
 			local stored_model = mod_storage:get_string("gemini_model")
 			local model = core.settings:get("didi.gemini_model")
 				or (stored_model ~= "" and stored_model)
@@ -744,12 +1103,7 @@ Conseils pour les châteaux et constructions médiévales :
 				system_instruction = {
 					parts = { { text = SYSTEM_PROMPT } },
 				},
-				contents = {
-					{
-						role = "user",
-						parts = { { text = prompt } },
-					},
-				},
+				contents = contents,
 				generationConfig = {
 					temperature = 0.4,
 				},
@@ -760,8 +1114,18 @@ Conseils pour les châteaux et constructions médiévales :
 				core.colorize("#ffff55", "[GOD] Invocation en cours : \"" .. prompt .. "\"...")
 			)
 
-			call_gemini(name, body, api_key, model, false)
+			call_gemini(name, body, api_key, model, false, origin, user_message, prompt)
 			return true
 		end,
 	})
+
+	return {
+		capture_origin = capture_origin,
+		get_world_context = get_world_context,
+		create_llm_env = create_llm_env,
+		execute_llm_code = execute_llm_code,
+		undo_last = undo_last,
+		undo_history = undo_history,
+		conversation_history = conversation_history,
+	}
 end
